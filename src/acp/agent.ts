@@ -21,7 +21,9 @@ import {
   type SetSessionModeResponse,
   type StopReason,
   type DeleteSessionRequest,
-  type DeleteSessionResponse
+  type DeleteSessionResponse,
+  type ForkSessionRequest,
+  type ForkSessionResponse
 } from '@agentclientprotocol/sdk'
 import { getAuthMethods } from './auth.js'
 import { SessionManager, type PiAcpSession } from './session.js'
@@ -262,13 +264,34 @@ export class PiAcpAgent implements ACPAgent {
           // **UNSTABLE** ACP capability used by Zed's codex-acp adapter.
           // Enables a native session picker in clients that support it.
           list: {},
-          delete: {}
+          delete: {},
+          fork: {}
         }
       }
     }
   }
 
   async newSession(params: NewSessionRequest) {
+    return this.startSession(params)
+  }
+
+  /**
+   * **UNSTABLE** ACP `session/fork`: a new pi session starting as a copy of the source's
+   * session file (pi's own `--fork`), so the model gets the very same history.
+   */
+  async unstable_forkSession(params: ForkSessionRequest): Promise<ForkSessionResponse> {
+    const stored = this.findStoredSession(params.sessionId)
+    if (!stored) {
+      throw RequestError.invalidParams(`Unknown sessionId: ${params.sessionId}`)
+    }
+
+    // pi writes a session file only once it holds an assistant message: until then
+    // there is nothing to copy, and pi refuses to fork it.
+    const forkFrom = hasContent(stored.sessionFile) ? stored.sessionFile : undefined
+    return this.startSession({ cwd: params.cwd, mcpServers: params.mcpServers ?? [] }, { forkFrom })
+  }
+
+  private async startSession(params: NewSessionRequest, opts?: { forkFrom?: string }) {
     if (!isAbsolute(params.cwd)) {
       throw RequestError.invalidParams(`cwd must be an absolute path: ${params.cwd}`)
     }
@@ -277,6 +300,7 @@ export class PiAcpAgent implements ACPAgent {
 
     const fileCommands = loadSlashCommands(params.cwd)
     const enableSkillCommands = getEnableSkillCommands(params.cwd)
+    const forking = opts !== undefined
 
     // Pi doesn't support mcpServers, but we accept and store.
     const session = await this.sessions.create({
@@ -284,7 +308,8 @@ export class PiAcpAgent implements ACPAgent {
       mcpServers: params.mcpServers,
       conn: this.conn,
       fileCommands,
-      piCommand: process.env.PI_ACP_PI_COMMAND
+      piCommand: process.env.PI_ACP_PI_COMMAND,
+      forkFrom: opts?.forkFrom
     })
 
     // Fetch state + models once (parallel) to reduce startup latency.
@@ -355,8 +380,9 @@ export class PiAcpAgent implements ACPAgent {
     }
     const { configOptions, models, modes } = configuration
 
-    const quietStartup = getQuietStartup(params.cwd)
-    const updateNotice = buildUpdateNotice()
+    // A fork continues a conversation the client already shows: no startup prelude.
+    const quietStartup = forking || getQuietStartup(params.cwd)
+    const updateNotice = forking ? null : buildUpdateNotice()
 
     // If quietStartup is enabled, suppress the full "startup info" prelude, but still surface
     // the "New version available" notice (if any) since it's high-signal and actionable.
@@ -1426,6 +1452,14 @@ async function setSessionModel(proc: PiRpcProcess, requestedModelId: string): Pr
   }
 
   await proc.setModel(provider, modelId)
+}
+
+function hasContent(path: string): boolean {
+  try {
+    return statSync(path).size > 0
+  } catch {
+    return false
+  }
 }
 
 function isSemver(v: string): boolean {

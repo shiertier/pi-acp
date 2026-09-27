@@ -103,6 +103,8 @@ type SpawnParams = {
   piCommand?: string
   /** If set, pi will persist the session to this exact file (via `--session <path>`). */
   sessionPath?: string
+  /** If set, pi starts a new session holding a copy of this session file (via `--fork <path>`). */
+  forkFrom?: string
 }
 
 export class PiRpcProcess {
@@ -161,6 +163,7 @@ export class PiRpcProcess {
     // (e.g. MCP extensions, prompt templates for workflows).
     const args = ['--mode', 'rpc', '--no-themes']
     if (params.sessionPath) args.push('--session', params.sessionPath)
+    else if (params.forkFrom) args.push('--fork', params.forkFrom)
 
     // Windows cmd launchers need shell escaping; direct executables use native argv.
     const start = shouldUseShellForPiCommand(cmd) ? crossSpawn : spawn
