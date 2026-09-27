@@ -672,6 +672,102 @@ test('PiAcpSession: prompt stays open through retry runs until agent_settled', a
   assert.equal(reason, 'end_turn')
 })
 
+function failedRun(errorMessage: string, willRetry = false) {
+  return {
+    type: 'agent_end',
+    willRetry,
+    messages: [
+      { role: 'user', content: 'hello' },
+      { role: 'assistant', content: [], stopReason: 'error', errorMessage }
+    ]
+  }
+}
+
+function newSession(proc: FakePiRpcProcess) {
+  return new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(new FakeAgentSideConnection()),
+    fileCommands: []
+  })
+}
+
+test('PiAcpSession: a failed model call fails the prompt with pi error', async () => {
+  const proc = new FakePiRpcProcess()
+  const session = newSession(proc)
+
+  const failed = session.prompt('hello')
+  proc.emit({ type: 'agent_start' })
+  proc.emit(failedRun('429 Rate limit reached for requests'))
+  proc.emit({ type: 'agent_settled' })
+  await assert.rejects(failed, { code: -32603, message: '429 Rate limit reached for requests' })
+
+  // The next turn starts clean.
+  const next = session.prompt('again')
+  proc.emit({ type: 'agent_start' })
+  proc.emit({ type: 'agent_end', willRetry: false, messages: [{ role: 'assistant', stopReason: 'stop' }] })
+  proc.emit({ type: 'agent_settled' })
+  assert.equal(await next, 'end_turn')
+})
+
+test('PiAcpSession: a failed sign-in fails the prompt as auth required, with pi error', async () => {
+  const proc = new FakePiRpcProcess()
+  const session = newSession(proc)
+
+  const p = session.prompt('hello')
+  proc.emit({ type: 'agent_start' })
+  proc.emit(failedRun('401 Your authentication token is invalid.'))
+  proc.emit({ type: 'agent_settled' })
+
+  await assert.rejects(p, (e: any) => {
+    assert.equal(e.code, -32000)
+    assert.match(e.message, /401 Your authentication token is invalid\./)
+    assert.ok(Array.isArray(e.data?.authMethods))
+    return true
+  })
+})
+
+test('PiAcpSession: a failed call pi retried successfully ends the turn', async () => {
+  const proc = new FakePiRpcProcess()
+  const session = newSession(proc)
+
+  const p = session.prompt('hello')
+  proc.emit({ type: 'agent_start' })
+  proc.emit(failedRun('529 overloaded', true))
+  proc.emit({ type: 'agent_start' })
+  proc.emit({ type: 'agent_end', willRetry: false, messages: [{ role: 'assistant', stopReason: 'stop' }] })
+  proc.emit({ type: 'agent_settled' })
+
+  assert.equal(await p, 'end_turn')
+})
+
+test('PiAcpSession: a prompt pi refuses fails with pi error', async () => {
+  const proc = new FakePiRpcProcess()
+  proc.prompt = async () => {
+    throw new Error('pi prompt failed: No model selected')
+  }
+
+  await assert.rejects(newSession(proc).prompt('hello'), {
+    code: -32603,
+    message: 'pi prompt failed: No model selected'
+  })
+})
+
+test('PiAcpSession: a cancelled turn is cancelled, not failed', async () => {
+  const proc = new FakePiRpcProcess()
+  const session = newSession(proc)
+
+  const p = session.prompt('hello')
+  await session.cancel()
+  proc.emit({ type: 'agent_start' })
+  proc.emit(failedRun('Request was aborted'))
+  proc.emit({ type: 'agent_settled' })
+
+  assert.equal(await p, 'cancelled')
+})
+
 test('PiAcpSession: does not re-emit startup info on first prompt after it was already sent', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()

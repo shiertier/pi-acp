@@ -6,7 +6,10 @@ import { getAuthMethods } from './auth.js'
  *
  * We can't do a full provider-specific check here, so we look for common substrings.
  */
-export function maybeAuthRequiredError(err: unknown): RequestError | null {
+export function maybeAuthRequiredError(
+  err: unknown,
+  message = 'Configure an API key or log in with an OAuth provider.'
+): RequestError | null {
   const msg = String((err as any)?.message ?? err ?? '')
   const s = msg.toLowerCase()
 
@@ -32,6 +35,6 @@ export function maybeAuthRequiredError(err: unknown): RequestError | null {
     {
       authMethods: getAuthMethods()
     },
-    'Configure an API key or log in with an OAuth provider.'
+    message
   )
 }
