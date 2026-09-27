@@ -44,7 +44,7 @@ type SessionCreateParams = {
   forkFrom?: string
 }
 
-export type StopReason = 'end_turn' | 'cancelled' | 'error'
+export type StopReason = 'end_turn' | 'cancelled'
 
 type PendingTurn = {
   resolve: (reason: StopReason) => void
@@ -308,6 +308,9 @@ export class PiAcpSession {
   // completes only when `agent_settled` is emitted.
   private inAgentLoop = false
 
+  // The error of the turn's last model call, if it failed: the prompt fails with it.
+  private turnError: string | null = null
+
   // For ACP diff support: capture file contents before edit/write mutations,
   // then emit ToolCallContent {type:"diff"}. Compatible structured edit/write
   // events may need to be implemented in pi in the future.
@@ -418,10 +421,6 @@ export class PiAcpSession {
     await this.proc.abort()
   }
 
-  wasCancelRequested(): boolean {
-    return this.cancelRequested
-  }
-
   private emit(update: SessionUpdate): void {
     // Serialize update delivery.
     this.lastEmit = this.lastEmit
@@ -463,10 +462,11 @@ export class PiAcpSession {
   private async settleTurn(): Promise<void> {
     // Ensure all updates derived from pi events (plus the final usage update) are
     // delivered before we resolve the ACP `session/prompt` request.
+    const error = this.cancelRequested ? null : this.turnError
     await this.publishContextUsage()
 
-    const reason: StopReason = this.cancelRequested ? 'cancelled' : 'end_turn'
-    this.pendingTurn?.resolve(reason)
+    if (error) this.pendingTurn?.reject(promptError(error))
+    else this.pendingTurn?.resolve(this.cancelRequested ? 'cancelled' : 'end_turn')
     this.pendingTurn = null
     this.inAgentLoop = false
 
@@ -543,6 +543,7 @@ export class PiAcpSession {
   private startTurn(t: QueuedTurn): void {
     this.cancelRequested = false
     this.inAgentLoop = false
+    this.turnError = null
 
     this.pendingTurn = { resolve: t.resolve, reject: t.reject }
 
@@ -561,12 +562,9 @@ export class PiAcpSession {
       void this.flushEmits().finally(() => {
         // If this looks like an auth/config issue, surface AUTH_REQUIRED so clients can offer terminal login.
         const authErr = maybeAuthRequiredError(err)
-        if (authErr) {
-          this.pendingTurn?.reject(authErr)
-        } else {
-          const reason: StopReason = this.cancelRequested ? 'cancelled' : 'error'
-          this.pendingTurn?.resolve(reason)
-        }
+        if (authErr) this.pendingTurn?.reject(authErr)
+        else if (this.cancelRequested) this.pendingTurn?.resolve('cancelled')
+        else this.pendingTurn?.reject(new RequestError(-32603, String((err as Error)?.message ?? err)))
 
         this.pendingTurn = null
         this.inAgentLoop = false
@@ -902,6 +900,8 @@ export class PiAcpSession {
         // One low-level run ended. Pi may still retry, compact, or process a queued
         // continuation, so keep the ACP turn open until `agent_settled`.
         this.inAgentLoop = false
+        // A failed call pi retries is not the turn's error; a later run may still fail.
+        this.turnError = ev.willRetry === true ? null : runError(ev)
         break
       }
 
@@ -1035,6 +1035,23 @@ function extensionUiToolCall(id: string, ev: PiRpcEvent) {
 function stringProp(source: Record<string, unknown>, key: string): string | null {
   const value = source[key]
   return typeof value === 'string' ? value : null
+}
+
+/** pi's error when the run's last assistant message is a failed model call. */
+function runError(ev: PiRpcEvent): string | null {
+  const messages: unknown[] = Array.isArray(ev.messages) ? ev.messages : []
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const message = messages[i] as Record<string, unknown> | null
+    if (message?.role !== 'assistant') continue
+    if (message.stopReason !== 'error') return null
+    return stringProp(message, 'errorMessage')?.trim() || 'The model call failed.'
+  }
+  return null
+}
+
+/** The failed model call as the prompt's error: pi's message, as auth required if it reads like one. */
+function promptError(message: string): RequestError {
+  return maybeAuthRequiredError(message, message) ?? new RequestError(-32603, message)
 }
 
 function optionIndex(optionId: string): number | null {
